@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+
+import click
+import docker
+import hashlib
+import os
+import psutil
+import signal
+import time
+import typing
+
+DOCKER_ENGINE = docker.from_env()
+
+BIRD_ANYCAST_UNAVAIL = '0.0.0.0/32'
+
+BIRD_TEMPLATE = 'define {key} = {prefix};'
+
+
+class ContainerNotFound(Exception):
+    pass
+
+
+class AnycastApplication:
+    def __init__(self, container_name: str, anycast_ip: str):
+        self.container_name = container_name
+        self.anycast_ip = anycast_ip
+
+    @property
+    def bird_filter_keyname(self) -> str:
+        return 'anycast_{name}'.format(name=self.container_name.replace('-', '_'))
+
+    def get_current_health(self) -> bool:
+        try:
+            container = get_container(name=self.container_name)
+            health = is_container_healthy(container)
+        except ContainerNotFound:
+            health = False
+        return health
+
+    def get_bird_filter(self) -> str:
+        if self.get_current_health():
+            prefix = f'{self.anycast_ip}/32'
+        else:
+            prefix = BIRD_ANYCAST_UNAVAIL
+        return BIRD_TEMPLATE.format(
+            key=self.bird_filter_keyname,
+            prefix=prefix)
+
+
+def get_container(name: str):
+    try:
+        container = DOCKER_ENGINE.containers.get(name)
+    except docker.errors.NotFound:
+        raise ContainerNotFound(f'A container with the name {name} was not found.')
+    return container
+
+
+def get_health_for_container(container: 'docker.Container'):
+    health = container.attrs.get('State', {}).get('Health', {}).get('Status', '')
+    if not health:
+        return 'unhealthy'
+    return health
+
+
+def is_container_running(container: 'docker.Container'):
+    return container.attrs.get('State', {}).get('Running', False)
+
+
+def is_container_healthy(container: 'docker.Container'):
+    if not is_container_running(container=container):
+        return False
+    health = get_health_for_container(container=container)
+    if health == 'healthy':
+        return True
+    return False
+
+
+def find_bird_pid() -> int:
+    bird_pid = None
+    for process in psutil.process_iter():
+        if process.name() == 'bird':
+            bird_pid = process.pid
+            break
+    if not bird_pid:
+        raise Exception('Cannot find Bird PID. No process matching name `bird`.')
+    return bird_pid
+
+
+def reload_bird():
+    bird_pid = find_bird_pid()
+    os.kill(bird_pid, signal.SIGHUP)
+
+
+@click.command()
+@click.option('--application', required=True, multiple=True, help='A container-name IP combination seperated by a colon')
+@click.option('--bird-filter-path', required=True, help='Path to the location of the Bird Anycast filter')
+@click.option('-i', '--check-interval', required=True, type=int, help='Amount of seconds to wait between polling service health')
+def main(application: typing.List[str], bird_filter_path: str, check_interval: int):
+    global_status = dict()
+    last_filter_shasum = ''
+    for app in application:
+        container_name, anycast_ip = app.split(':', 2)
+        if ':' in anycast_ip:
+            raise Exception(f'Invalid name for application {app}. May only contain one colon (:)')
+        global_status[container_name] = AnycastApplication(container_name=container_name, anycast_ip=anycast_ip)
+    while True:
+        new_filter_contents = ''
+        current_filter_contents = open(bird_filter_path, 'rb').read()
+        current_filter_shasum = hashlib.sha256(current_filter_contents).hexdigest()
+        for container_name, application in global_status.items():
+            anycast_filter = application.get_bird_filter()
+            new_filter_contents += anycast_filter
+            new_filter_contents += '\n'
+        new_filter_shasum = hashlib.sha256(new_filter_contents.encode('utf-8')).hexdigest()
+        if last_filter_shasum != new_filter_shasum or \
+                new_filter_shasum != current_filter_shasum:
+            open(bird_filter_path, 'w').write(new_filter_contents)
+            reload_bird()
+        last_filter_shasum = new_filter_shasum
+        time.sleep(check_interval)
+
+
+if __name__ == '__main__':
+    main()
